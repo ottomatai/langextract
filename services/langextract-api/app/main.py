@@ -1,0 +1,155 @@
+"""FastAPI app exposing LangExtract via HTTP."""
+
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+import time
+import uuid
+from typing import Any
+from typing import Dict
+from typing import List
+
+from fastapi import Depends
+from fastapi import FastAPI
+from fastapi import HTTPException
+from fastapi import status
+from fastapi.responses import JSONResponse
+import langextract as lx
+
+from app.auth import require_api_key
+from app.schemas import ExtractRequest
+from app.schemas import ExtractResponse
+from app import settings
+
+app = FastAPI(title="LangExtract API", version="1.0.0")
+_semaphore = asyncio.Semaphore(settings.MAX_CONCURRENCY)
+
+
+def _validate_language_model_params(
+    params: Dict[str, Any] | None,
+) -> Dict[str, Any] | None:
+  if params is None:
+    return None
+
+  allowed_keys = {
+      "temperature",
+      "vertexai",
+      "batch",
+      "http_options",
+      "top_p",
+      "max_output_tokens",
+      "candidate_count",
+      "safety_settings",
+  }
+  unknown = set(params.keys()) - allowed_keys
+  if unknown:
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"Unsupported language_model_params keys: {sorted(unknown)}",
+    )
+  return params
+
+
+def _to_json(value: Any) -> Any:
+  if dataclasses.is_dataclass(value):
+    return dataclasses.asdict(value)
+  if isinstance(value, list):
+    return [_to_json(v) for v in value]
+  if isinstance(value, dict):
+    return {k: _to_json(v) for k, v in value.items()}
+  if hasattr(value, "__dict__"):
+    return _to_json(vars(value))
+  return value
+
+
+def _normalize_result(result: Any) -> Dict[str, Any]:
+  if isinstance(result, list):
+    return {"documents": _to_json(result)}
+  return {"document": _to_json(result)}
+
+
+@app.get("/healthz")
+def healthz() -> Dict[str, bool]:
+  return {"ok": True}
+
+
+@app.get("/readyz")
+def readyz() -> JSONResponse:
+  missing: List[str] = []
+  if not settings.SERVICE_API_KEY:
+    missing.append("SERVICE_API_KEY")
+  if not settings.LANGEXTRACT_API_KEY:
+    missing.append("LANGEXTRACT_API_KEY")
+
+  if missing:
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"ready": False, "missing": missing},
+    )
+  return JSONResponse(status_code=status.HTTP_200_OK, content={"ready": True})
+
+
+@app.post("/v1/extract", response_model=ExtractResponse)
+async def extract_endpoint(
+    payload: ExtractRequest, _: None = Depends(require_api_key)
+) -> ExtractResponse:
+  request_id = str(uuid.uuid4())
+  if len(payload.text) > settings.MAX_TEXT_CHARS:
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"text exceeds MAX_TEXT_CHARS={settings.MAX_TEXT_CHARS}",
+    )
+  if len(payload.examples) > settings.MAX_EXAMPLES:
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"examples exceed MAX_EXAMPLES={settings.MAX_EXAMPLES}",
+    )
+  if payload.max_workers and payload.max_workers > settings.MAX_WORKERS:
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"max_workers exceeds MAX_WORKERS={settings.MAX_WORKERS}",
+    )
+
+  lm_params = _validate_language_model_params(payload.language_model_params)
+  started = time.perf_counter()
+  examples_payload = [
+      example.model_dump() if hasattr(example, "model_dump") else example.dict()
+      for example in payload.examples
+  ]
+
+  async with _semaphore:
+    try:
+      result = await asyncio.wait_for(
+          asyncio.to_thread(
+              lx.extract,
+              text_or_documents=payload.text,
+              prompt_description=payload.prompt_description,
+              examples=examples_payload,
+              model_id=payload.model_id or settings.DEFAULT_MODEL_ID,
+              api_key=settings.LANGEXTRACT_API_KEY,
+              extraction_passes=payload.extraction_passes,
+              max_workers=payload.max_workers,
+              max_char_buffer=payload.max_char_buffer,
+              language_model_params=lm_params,
+              show_progress=False,
+          ),
+          timeout=settings.REQUEST_TIMEOUT_SECONDS,
+      )
+    except asyncio.TimeoutError as exc:
+      raise HTTPException(
+          status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+          detail=f"Request timed out. request_id={request_id}",
+      ) from exc
+    except HTTPException:
+      raise
+    except Exception as exc:
+      raise HTTPException(
+          status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+          detail=f"Extraction failed. request_id={request_id}",
+      ) from exc
+
+  timing_ms = int((time.perf_counter() - started) * 1000)
+  return ExtractResponse(
+      request_id=request_id, timing_ms=timing_ms, result=_normalize_result(result)
+  )
