@@ -83,6 +83,39 @@ def _normalize_result(result: Any) -> Dict[str, Any]:
   return {"document": _to_json(result)}
 
 
+def _markdown_from_result(result_payload: Dict[str, Any]) -> str:
+  lines: list[str] = ["# Extraction Result", ""]
+  doc = result_payload.get("document")
+  docs = result_payload.get("documents")
+  items = docs if isinstance(docs, list) else ([doc] if doc else [])
+  for idx, item in enumerate(items, start=1):
+    if not isinstance(item, dict):
+      continue
+    lines.append(f"## Document {idx}")
+    if item.get("_document_id"):
+      lines.append(f"- `document_id`: `{item['_document_id']}`")
+    if item.get("text"):
+      lines.append(f"- `text_length`: `{len(item['text'])}`")
+    exts = item.get("extractions") or []
+    lines.append("")
+    lines.append("### Extractions")
+    if not exts:
+      lines.append("- None")
+    else:
+      for ex in exts:
+        if not isinstance(ex, dict):
+          continue
+        eclass = ex.get("extraction_class", "unknown")
+        etext = ex.get("extraction_text", "")
+        lines.append(f"- **{eclass}**: `{etext}`")
+        attrs = ex.get("attributes") or {}
+        if isinstance(attrs, dict) and attrs:
+          attrs_text = ", ".join(f"{k}={v}" for k, v in attrs.items())
+          lines.append(f"  attributes: {attrs_text}")
+    lines.append("")
+  return "\n".join(lines).strip() + "\n"
+
+
 def _build_examples(payload_examples: Any) -> list[Any]:
   built_examples = []
   for example in payload_examples:
@@ -228,8 +261,15 @@ async def extract_endpoint(
   logger.info(
       "extract_request_succeeded request_id=%s timing_ms=%s", request_id, timing_ms
   )
+  normalized = _normalize_result(result)
+  markdown = None
+  if payload.output_format.lower() == "markdown":
+    markdown = _markdown_from_result(normalized)
   return ExtractResponse(
-      request_id=request_id, timing_ms=timing_ms, result=_normalize_result(result)
+      request_id=request_id,
+      timing_ms=timing_ms,
+      result=normalized,
+      markdown=markdown,
   )
 
 
@@ -242,6 +282,7 @@ async def extract_pdf_endpoint(
     extraction_passes: int = Form(default=1),
     max_workers: int = Form(default=10),
     max_char_buffer: int = Form(default=1000),
+    output_format: str = Form(default="json"),
     _: None = Depends(require_api_key),
 ) -> ExtractResponse:
   request_id = str(uuid.uuid4())
@@ -340,6 +381,13 @@ async def extract_pdf_endpoint(
       timing_ms,
       len(text),
   )
+  normalized = _normalize_result(result)
+  markdown = None
+  if output_format.lower() == "markdown":
+    markdown = _markdown_from_result(normalized)
   return ExtractResponse(
-      request_id=request_id, timing_ms=timing_ms, result=_normalize_result(result)
+      request_id=request_id,
+      timing_ms=timing_ms,
+      result=normalized,
+      markdown=markdown,
   )
