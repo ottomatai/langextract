@@ -24,6 +24,7 @@ from fastapi import UploadFile
 from fastapi import status
 from fastapi.responses import JSONResponse
 import langextract as lx
+from google import genai
 
 from app.auth import require_api_key
 from app.schemas import ExtractRequest
@@ -207,6 +208,33 @@ def _markdown_from_pdf_text(full_text: str, page_texts: list[str]) -> str:
     lines.append(page if page else "(no extracted text)")
     lines.append("")
   return "\n".join(lines).strip() + "\n"
+
+
+def _markdown_from_pdf_structured_with_llm(full_text: str) -> str:
+  client = genai.Client(api_key=settings.LANGEXTRACT_API_KEY)
+  prompt = (
+      "You are a document structuring assistant. Convert the raw PDF text into "
+      "well-structured Markdown.\n\n"
+      "Rules:\n"
+      "- Do not invent facts.\n"
+      "- Preserve original language.\n"
+      "- Create clear section headings.\n"
+      "- Use markdown tables for any tabular or pricing-like content.\n"
+      "- Use bullet points for lists, terms, and notes.\n"
+      "- Keep contact details, terms, dates, and numeric values explicit.\n"
+      "- If the document has repeated fragments, consolidate when safe.\n\n"
+      "Return Markdown only.\n\n"
+      "Raw text:\n"
+      f"{full_text}"
+  )
+  response = client.models.generate_content(
+      model=settings.DEFAULT_MODEL_ID,
+      contents=prompt,
+  )
+  markdown = (response.text or "").strip()
+  if not markdown:
+    raise ValueError("Empty markdown response from model.")
+  return markdown + "\n"
 
 
 @app.get("/healthz")
@@ -441,6 +469,8 @@ async def extract_pdf_endpoint(
     markdown = _markdown_from_result(normalized)
   elif output_format.lower() == "full_markdown":
     markdown = _markdown_from_pdf_text(text, page_texts)
+  elif output_format.lower() == "structured_markdown":
+    markdown = _markdown_from_pdf_structured_with_llm(text)
   return ExtractResponse(
       request_id=request_id,
       timing_ms=timing_ms,
