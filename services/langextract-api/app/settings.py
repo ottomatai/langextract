@@ -15,6 +15,13 @@ def _int_env(name: str, default: int) -> int:
     return default
 
 
+def _bool_env(name: str, default: bool) -> bool:
+  raw = os.getenv(name)
+  if raw is None:
+    return default
+  return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 SERVICE_API_KEY = os.getenv("SERVICE_API_KEY", "")
 LANGEXTRACT_API_KEY = os.getenv("LANGEXTRACT_API_KEY", "")
 
@@ -24,3 +31,4 @@ MAX_CONCURRENCY = _int_env("MAX_CONCURRENCY", 4)
 MAX_TEXT_CHARS = _int_env("MAX_TEXT_CHARS", 100000)
 MAX_EXAMPLES = _int_env("MAX_EXAMPLES", 50)
 MAX_WORKERS = _int_env("MAX_WORKERS", 20)
+ENABLE_RTL_HEBREW_FIX = _bool_env("ENABLE_RTL_HEBREW_FIX", True)

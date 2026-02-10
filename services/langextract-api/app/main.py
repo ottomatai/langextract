@@ -7,6 +7,7 @@ import dataclasses
 import io
 import json
 import logging
+import re
 import time
 import traceback
 import uuid
@@ -157,8 +158,36 @@ def _extract_text_from_pdf_bytes(pdf_bytes: bytes) -> tuple[str, list[str]]:
   reader = PdfReader(io.BytesIO(pdf_bytes))
   parts: list[str] = []
   for page in reader.pages:
-    parts.append(page.extract_text() or "")
+    raw = page.extract_text() or ""
+    parts.append(_normalize_rtl_line_order(raw))
   return "\n\n".join(parts).strip(), parts
+
+
+_HEBREW_CHAR_RE = re.compile(r"[\u0590-\u05FF]")
+
+
+def _line_looks_hebrew(line: str) -> bool:
+  if not line.strip():
+    return False
+  heb_count = len(_HEBREW_CHAR_RE.findall(line))
+  # Avoid reordering lines that are mostly numeric/latin.
+  return heb_count >= 3 and heb_count >= max(3, int(len(line) * 0.15))
+
+
+def _normalize_rtl_line_order(text: str) -> str:
+  if not settings.ENABLE_RTL_HEBREW_FIX:
+    return text
+  out_lines: list[str] = []
+  for line in text.splitlines():
+    if _line_looks_hebrew(line):
+      tokens = line.split()
+      if len(tokens) > 1:
+        out_lines.append(" ".join(reversed(tokens)))
+      else:
+        out_lines.append(line)
+    else:
+      out_lines.append(line)
+  return "\n".join(out_lines)
 
 
 def _markdown_from_pdf_text(full_text: str, page_texts: list[str]) -> str:
