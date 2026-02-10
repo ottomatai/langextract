@@ -145,7 +145,7 @@ def _build_examples(payload_examples: Any) -> list[Any]:
   return built_examples
 
 
-def _extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
+def _extract_text_from_pdf_bytes(pdf_bytes: bytes) -> tuple[str, list[str]]:
   try:
     from pypdf import PdfReader
   except Exception as exc:
@@ -155,10 +155,29 @@ def _extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
     ) from exc
 
   reader = PdfReader(io.BytesIO(pdf_bytes))
-  parts = []
+  parts: list[str] = []
   for page in reader.pages:
     parts.append(page.extract_text() or "")
-  return "\n\n".join(parts).strip()
+  return "\n\n".join(parts).strip(), parts
+
+
+def _markdown_from_pdf_text(full_text: str, page_texts: list[str]) -> str:
+  lines: list[str] = ["# PDF Extracted Text", ""]
+  lines.append(f"- `page_count`: `{len(page_texts)}`")
+  lines.append(f"- `text_length`: `{len(full_text)}`")
+  lines.append("")
+  lines.append("## Full Text")
+  lines.append("")
+  lines.append(full_text if full_text else "(empty)")
+  lines.append("")
+  lines.append("## Pages")
+  lines.append("")
+  for idx, page in enumerate(page_texts, start=1):
+    lines.append(f"### Page {idx}")
+    lines.append("")
+    lines.append(page if page else "(no extracted text)")
+    lines.append("")
+  return "\n".join(lines).strip() + "\n"
 
 
 @app.get("/healthz")
@@ -282,6 +301,7 @@ async def extract_pdf_endpoint(
     extraction_passes: int = Form(default=1),
     max_workers: int = Form(default=10),
     max_char_buffer: int = Form(default=1000),
+    include_full_text: bool = Form(default=True),
     output_format: str = Form(default="json"),
     _: None = Depends(require_api_key),
 ) -> ExtractResponse:
@@ -333,7 +353,7 @@ async def extract_pdf_endpoint(
         status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty."
     )
 
-  text = _extract_text_from_pdf_bytes(pdf_bytes)
+  text, page_texts = _extract_text_from_pdf_bytes(pdf_bytes)
   if not text:
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
@@ -382,9 +402,16 @@ async def extract_pdf_endpoint(
       len(text),
   )
   normalized = _normalize_result(result)
+  normalized["pdf"] = {
+      "page_count": len(page_texts),
+      "full_text": text if include_full_text else None,
+      "page_texts": page_texts if include_full_text else None,
+  }
   markdown = None
   if output_format.lower() == "markdown":
     markdown = _markdown_from_result(normalized)
+  elif output_format.lower() == "full_markdown":
+    markdown = _markdown_from_pdf_text(text, page_texts)
   return ExtractResponse(
       request_id=request_id,
       timing_ms=timing_ms,
