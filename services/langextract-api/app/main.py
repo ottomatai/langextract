@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import logging
 import time
+import traceback
 import uuid
 from typing import Any
 from typing import Dict
@@ -24,6 +26,12 @@ from app import settings
 
 app = FastAPI(title="LangExtract API", version="1.0.0")
 _semaphore = asyncio.Semaphore(settings.MAX_CONCURRENCY)
+logger = logging.getLogger("langextract_api")
+if not logger.handlers:
+  logging.basicConfig(
+      level=logging.INFO,
+      format="%(asctime)s %(levelname)s %(name)s %(message)s",
+  )
 
 
 def _validate_language_model_params(
@@ -95,6 +103,13 @@ async def extract_endpoint(
     payload: ExtractRequest, _: None = Depends(require_api_key)
 ) -> ExtractResponse:
   request_id = str(uuid.uuid4())
+  logger.info(
+      "extract_request_started request_id=%s model_id=%s text_len=%s examples=%s",
+      request_id,
+      payload.model_id,
+      len(payload.text),
+      len(payload.examples),
+  )
   if len(payload.text) > settings.MAX_TEXT_CHARS:
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
@@ -137,19 +152,34 @@ async def extract_endpoint(
           timeout=settings.REQUEST_TIMEOUT_SECONDS,
       )
     except asyncio.TimeoutError as exc:
+      logger.error(
+          "extract_request_timeout request_id=%s timeout_seconds=%s",
+          request_id,
+          settings.REQUEST_TIMEOUT_SECONDS,
+      )
       raise HTTPException(
           status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
           detail=f"Request timed out. request_id={request_id}",
       ) from exc
     except HTTPException:
+      logger.exception("extract_request_http_exception request_id=%s", request_id)
       raise
     except Exception as exc:
+      logger.error(
+          "extract_request_failed request_id=%s error=%s traceback=%s",
+          request_id,
+          repr(exc),
+          traceback.format_exc(),
+      )
       raise HTTPException(
           status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
           detail=f"Extraction failed. request_id={request_id}",
       ) from exc
 
   timing_ms = int((time.perf_counter() - started) * 1000)
+  logger.info(
+      "extract_request_succeeded request_id=%s timing_ms=%s", request_id, timing_ms
+  )
   return ExtractResponse(
       request_id=request_id, timing_ms=timing_ms, result=_normalize_result(result)
   )
