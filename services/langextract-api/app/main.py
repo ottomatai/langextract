@@ -237,6 +237,17 @@ def _markdown_from_pdf_structured_with_llm(full_text: str) -> str:
   return markdown + "\n"
 
 
+def _is_hallucinated_markdown(full_text: str, markdown: str) -> bool:
+  # Guardrail for obvious fabrication: many long latin tokens not in source text.
+  src_tokens = set(re.findall(r"[A-Za-z]{4,}", full_text.lower()))
+  out_tokens = re.findall(r"[A-Za-z]{4,}", markdown.lower())
+  if not out_tokens:
+    return False
+  unsupported = [t for t in out_tokens if t not in src_tokens]
+  # Conservative threshold: if enough unsupported tokens appear, fallback.
+  return len(unsupported) >= 20
+
+
 @app.get("/healthz")
 def healthz() -> Dict[str, bool]:
   return {"ok": True}
@@ -470,7 +481,15 @@ async def extract_pdf_endpoint(
   elif output_format.lower() == "full_markdown":
     markdown = _markdown_from_pdf_text(text, page_texts)
   elif output_format.lower() == "structured_markdown":
-    markdown = _markdown_from_pdf_structured_with_llm(text)
+    candidate = _markdown_from_pdf_structured_with_llm(text)
+    if _is_hallucinated_markdown(text, candidate):
+      logger.warning(
+          "structured_markdown_hallucination_detected request_id=%s fallback=full_markdown",
+          request_id,
+      )
+      markdown = _markdown_from_pdf_text(text, page_texts)
+    else:
+      markdown = candidate
   return ExtractResponse(
       request_id=request_id,
       timing_ms=timing_ms,
