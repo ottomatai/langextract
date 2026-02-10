@@ -77,6 +77,35 @@ def _normalize_result(result: Any) -> Dict[str, Any]:
   return {"document": _to_json(result)}
 
 
+def _build_examples(payload_examples: Any) -> list[Any]:
+  built_examples = []
+  for example in payload_examples:
+    raw_extractions = []
+    for extraction in example.extractions:
+      extraction_class = extraction.get("extraction_class")
+      extraction_text = extraction.get("extraction_text")
+      if not extraction_class or not extraction_text:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Each extraction in examples must include "
+                "'extraction_class' and 'extraction_text'."
+            ),
+        )
+      raw_extractions.append(
+          lx.data.Extraction(
+              extraction_class=extraction_class,
+              extraction_text=extraction_text,
+              attributes=extraction.get("attributes"),
+              description=extraction.get("description"),
+          )
+      )
+    built_examples.append(
+      lx.data.ExampleData(text=example.text, extractions=raw_extractions)
+    )
+  return built_examples
+
+
 @app.get("/healthz")
 def healthz() -> Dict[str, bool]:
   return {"ok": True}
@@ -128,10 +157,7 @@ async def extract_endpoint(
 
   lm_params = _validate_language_model_params(payload.language_model_params)
   started = time.perf_counter()
-  examples_payload = [
-      example.model_dump() if hasattr(example, "model_dump") else example.dict()
-      for example in payload.examples
-  ]
+  examples_payload = _build_examples(payload.examples)
 
   async with _semaphore:
     try:
