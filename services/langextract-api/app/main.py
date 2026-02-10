@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import io
+import json
 import logging
 import time
 import traceback
@@ -13,8 +15,11 @@ from typing import Dict
 from typing import List
 
 from fastapi import Depends
+from fastapi import File
 from fastapi import FastAPI
+from fastapi import Form
 from fastapi import HTTPException
+from fastapi import UploadFile
 from fastapi import status
 from fastapi.responses import JSONResponse
 import langextract as lx
@@ -22,6 +27,7 @@ import langextract as lx
 from app.auth import require_api_key
 from app.schemas import ExtractRequest
 from app.schemas import ExtractResponse
+from app.schemas import ExtractionExample
 from app import settings
 
 app = FastAPI(title="LangExtract API", version="1.0.0")
@@ -104,6 +110,22 @@ def _build_examples(payload_examples: Any) -> list[Any]:
       lx.data.ExampleData(text=example.text, extractions=raw_extractions)
     )
   return built_examples
+
+
+def _extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
+  try:
+    from pypdf import PdfReader
+  except Exception as exc:
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail="PDF support dependency unavailable.",
+    ) from exc
+
+  reader = PdfReader(io.BytesIO(pdf_bytes))
+  parts = []
+  for page in reader.pages:
+    parts.append(page.extract_text() or "")
+  return "\n\n".join(parts).strip()
 
 
 @app.get("/healthz")
@@ -205,6 +227,118 @@ async def extract_endpoint(
   timing_ms = int((time.perf_counter() - started) * 1000)
   logger.info(
       "extract_request_succeeded request_id=%s timing_ms=%s", request_id, timing_ms
+  )
+  return ExtractResponse(
+      request_id=request_id, timing_ms=timing_ms, result=_normalize_result(result)
+  )
+
+
+@app.post("/v1/extract-pdf", response_model=ExtractResponse)
+async def extract_pdf_endpoint(
+    file: UploadFile = File(...),
+    prompt_description: str = Form(...),
+    examples_json: str = Form(...),
+    model_id: str = Form(default=settings.DEFAULT_MODEL_ID),
+    extraction_passes: int = Form(default=1),
+    max_workers: int = Form(default=10),
+    max_char_buffer: int = Form(default=1000),
+    _: None = Depends(require_api_key),
+) -> ExtractResponse:
+  request_id = str(uuid.uuid4())
+  logger.info(
+      "extract_pdf_request_started request_id=%s model_id=%s filename=%s",
+      request_id,
+      model_id,
+      file.filename,
+  )
+
+  if not file.filename or not file.filename.lower().endswith(".pdf"):
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Only PDF files are supported.",
+    )
+
+  if max_workers > settings.MAX_WORKERS:
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"max_workers exceeds MAX_WORKERS={settings.MAX_WORKERS}",
+    )
+
+  try:
+    examples_raw = json.loads(examples_json)
+  except json.JSONDecodeError as exc:
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="examples_json must be valid JSON.",
+    ) from exc
+
+  if not isinstance(examples_raw, list) or not examples_raw:
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="examples_json must be a non-empty JSON array.",
+    )
+
+  try:
+    examples_models = [ExtractionExample.model_validate(x) for x in examples_raw]
+  except Exception as exc:
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"Invalid examples_json format: {exc}",
+    ) from exc
+
+  pdf_bytes = await file.read()
+  if not pdf_bytes:
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty."
+    )
+
+  text = _extract_text_from_pdf_bytes(pdf_bytes)
+  if not text:
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Could not extract text from PDF.",
+    )
+  if len(text) > settings.MAX_TEXT_CHARS:
+    text = text[: settings.MAX_TEXT_CHARS]
+
+  examples_payload = _build_examples(examples_models)
+  started = time.perf_counter()
+
+  async with _semaphore:
+    try:
+      result = await asyncio.wait_for(
+          asyncio.to_thread(
+              lx.extract,
+              text_or_documents=text,
+              prompt_description=prompt_description,
+              examples=examples_payload,
+              model_id=model_id or settings.DEFAULT_MODEL_ID,
+              api_key=settings.LANGEXTRACT_API_KEY,
+              extraction_passes=extraction_passes,
+              max_workers=max_workers,
+              max_char_buffer=max_char_buffer,
+              show_progress=False,
+          ),
+          timeout=settings.REQUEST_TIMEOUT_SECONDS,
+      )
+    except Exception as exc:
+      logger.error(
+          "extract_pdf_request_failed request_id=%s error=%s traceback=%s",
+          request_id,
+          repr(exc),
+          traceback.format_exc(),
+      )
+      raise HTTPException(
+          status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+          detail=f"Extraction failed. request_id={request_id}",
+      ) from exc
+
+  timing_ms = int((time.perf_counter() - started) * 1000)
+  logger.info(
+      "extract_pdf_request_succeeded request_id=%s timing_ms=%s text_len=%s",
+      request_id,
+      timing_ms,
+      len(text),
   )
   return ExtractResponse(
       request_id=request_id, timing_ms=timing_ms, result=_normalize_result(result)
